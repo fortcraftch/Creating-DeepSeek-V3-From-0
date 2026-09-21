@@ -11,10 +11,10 @@ Core benchmark families used in / closely related to the GPT-3 evaluation:
   plus a small synthetic arithmetic evaluation.
 
 Install dependencies in your project environment:
-    pip install -U datasets transformers huggingface_hub requests tqdm tiktoken
+    pip install -U datasets tqdm tiktoken
 
 Examples:
-    python eval.py --model DeepSeekV3Base.pt
+    python eval.py --model log/model_00250.pt
     python eval.py --model DeepSeekV3Base.pt --tasks hellaswag,lambada,piqa,mmlu,gsm8k
     python eval.py --model log/model_19072.pt --tasks all --limit 1000
 """
@@ -471,146 +471,155 @@ class MLA(nn.Module):
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        if attn_impl == "naive":
-            self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
-            self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
-        else:
-            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
-            self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int = 0,
+        freqs_cis: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        Full-sequence MLA path used by evaluation.
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0, freqs_cis: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None):
-        # Training uses a direct, differentiable MLA path without KV-cache
-        # assignments. The original inference implementation stores K/V in
-        # buffers, which would sever the autograd graph during pretraining.
-        if self.training:
-            bsz, seqlen, _ = x.size()
-            if freqs_cis is None:
-                raise ValueError("freqs_cis is required during training")
+        This implementation intentionally has no KV cache. Benchmark scoring
+        needs logits for every token in the supplied sequence, so keeping a
+        decode-time cache here would add state and memory without helping the
+        benchmark workload.
+        """
+        del start_pos  # kept for API compatibility with Block
 
-            if self.q_lora_rank == 0:
-                q = self.wq(x)
-            else:
-                q = self.wq_b(self.q_norm(self.wq_a(x)))
-            q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-            q_nope, q_pe = torch.split(
-                q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-            q_pe = apply_rotary_emb(q_pe, freqs_cis)
-
-            kv = self.wkv_a(x)
-            kv, k_pe = torch.split(
-                kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(
-                bsz,
-                seqlen,
-                self.n_local_heads,
-                self.qk_nope_head_dim + self.v_head_dim,
-            )
-            k_nope, v = torch.split(
-                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
-
-            k = torch.cat(
-                [k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1
-            )
-            q = torch.cat([q_nope, q_pe], dim=-1)
-
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask,
-                is_causal=(mask is None),
-            )
-            y = y.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-            return self.wo(y)
-
-        # Inference path: preserve the repository's original cache-aware MLA.
         bsz, seqlen, _ = x.size()
-        end_pos = start_pos + seqlen
-        if freqs_cis is None:
-            freqs_cis = self._freqs_from_length(seqlen, x.device)
 
+        if freqs_cis is None:
+            raise ValueError("freqs_cis is required for MLA evaluation")
+
+        # ---------------------------------------------------------
+        # Query projection
+        # ---------------------------------------------------------
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(
-            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+            q = self.wq_b(
+                self.q_norm(
+                    self.wq_a(x)
+                )
+            )
 
-        if attn_impl == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(
-                bsz, seqlen, self.n_local_heads,
-                self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = torch.split(
-                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
-            k = torch.cat(
-                [k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1
-            )
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum(
-                "bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]
-            ) * self.softmax_scale
-        else:
-            wkv_b = (
-                self.wkv_b.weight
-                if self.wkv_b.scale is None
-                else weight_dequant(
-                    self.wkv_b.weight, self.wkv_b.scale, kernel_block_size
+        q = q.view(
+            bsz,
+            seqlen,
+            self.n_local_heads,
+            self.qk_head_dim,
+        )
+
+        q_nope, q_pe = torch.split(
+            q,
+            [
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            ],
+            dim=-1,
+        )
+
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+
+        # ---------------------------------------------------------
+        # KV latent projection
+        # ---------------------------------------------------------
+        kv = self.wkv_a(x)
+
+        kv, k_pe = torch.split(
+            kv,
+            [
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            ],
+            dim=-1,
+        )
+
+        k_pe = apply_rotary_emb(
+            k_pe.unsqueeze(2),
+            freqs_cis,
+        )
+
+        # ---------------------------------------------------------
+        # Absorb WKV-B into Q / V path.
+        # This is the same mathematical "absorb" formulation used by
+        # the adapted DeepSeek implementation, but without cache writes.
+        # ---------------------------------------------------------
+        wkv_b = self.wkv_b.weight
+
+        if getattr(self.wkv_b, "scale", None) is not None:
+            if weight_dequant is None:
+                raise RuntimeError(
+                    "Quantized MLA weight requires the project's kernel.py"
                 )
+
+            wkv_b = weight_dequant(
+                self.wkv_b.weight,
+                self.wkv_b.scale,
+                kernel_block_size,
             )
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum(
-                "bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim]
+
+        wkv_b = wkv_b.view(
+            self.n_local_heads,
+            -1,
+            self.kv_lora_rank,
+        )
+
+        q_nope = torch.einsum(
+            "bshd,hdc->bshc",
+            q_nope,
+            wkv_b[:, :self.qk_nope_head_dim],
+        )
+
+        latent_kv = self.kv_norm(kv)
+
+        # ---------------------------------------------------------
+        # Attention scores
+        # ---------------------------------------------------------
+        scores = (
+            torch.einsum(
+                "bshc,btc->bsht",
+                q_nope,
+                latent_kv,
             )
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            scores = (
-                torch.einsum(
-                    "bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]
-                )
-                + torch.einsum(
-                    "bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos]
-                )
-            ) * self.softmax_scale
+            +
+            torch.einsum(
+                "bshr,btr->bsht",
+                q_pe,
+                k_pe.squeeze(2),
+            )
+        ) * self.softmax_scale
 
         if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        if attn_impl == "naive":
-            x = torch.einsum(
-                "bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos]
-            )
-        else:
-            x = torch.einsum(
-                "bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos]
-            )
-            x = torch.einsum(
-                "bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:]
-            )
-        return self.wo(x.flatten(2))
+            scores = scores + mask.unsqueeze(1)
 
+        scores = F.softmax(
+            scores,
+            dim=-1,
+            dtype=torch.float32,
+        ).type_as(x)
+
+        # ---------------------------------------------------------
+        # Values
+        # ---------------------------------------------------------
+        values = torch.einsum(
+            "bsht,btc->bshc",
+            scores,
+            latent_kv,
+        )
+
+        values = torch.einsum(
+            "bshc,hdc->bshd",
+            values,
+            wkv_b[:, -self.v_head_dim:],
+        )
+
+        # ---------------------------------------------------------
+        # Output projection
+        # ---------------------------------------------------------
+        return self.wo(values.flatten(2))
 
 
 class MLP(nn.Module):
@@ -864,9 +873,14 @@ class DeepSeekV3(nn.Module):
     conventions as the GPT-2 training file used in this project.
     """
 
-    def __init__(self, config: DeepSeekV3Config):
+    def __init__(
+        self,
+        config: DeepSeekV3Config,
+        init_weights: bool = True,
+    ):
         super().__init__()
         self.config = config
+        self.init_weights = init_weights
 
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -977,6 +991,14 @@ class Adapter:
         if hasattr(out, "logits"):
             out = out.logits
 
+        # The checkpoint uses a padded vocabulary (50304), while the GPT-2
+        # tokenizer only defines 50257 valid token IDs. Padding rows must not
+        # compete during generation/evaluation.
+        valid_vocab = getattr(self.enc, "n_vocab", out.size(-1))
+        if out.size(-1) > valid_vocab:
+            out = out.clone()
+            out[..., valid_vocab:] = float("-inf")
+
         return out
 
     @torch.no_grad()
@@ -1057,9 +1079,11 @@ def load_model(identifier, device, enc):
             f"was not found."
         )
 
+    # Load checkpoint on CPU first. This avoids putting a second copy of the
+    # checkpoint on GPU while the model object is being constructed.
     ckpt = torch.load(
         p,
-        map_location=device,
+        map_location="cpu",
         weights_only=False,
     )
 
@@ -1069,11 +1093,18 @@ def load_model(identifier, device, enc):
         )
 
     cfg = DeepSeekV3Config(**ckpt["config"])
-    model = DeepSeekV3(cfg)
+    model = DeepSeekV3(cfg, init_weights=False)
 
-    model.load_state_dict(
-        ckpt["model"]
+    missing, unexpected = model.load_state_dict(
+        ckpt["model"],
+        strict=False,
     )
+
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint/model mismatch for {p}: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
 
     model.to(device).eval()
 
@@ -1158,7 +1189,11 @@ def eval_hellaswag(model, limit):
         correct_sum += pred_s == label
         correct_norm += pred_n == label
         total += 1
-    return {"accuracy": correct_sum / total, "accuracy_norm": correct_norm / total, "total": total}
+    return {
+        "accuracy": correct_sum / total if total else float("nan"),
+        "accuracy_norm": correct_norm / total if total else float("nan"),
+        "total": total,
+    }
 
 
 def eval_lambada(model, limit):
@@ -1467,7 +1502,7 @@ TASKS = {
 
 DEFAULT_TASKS = [
     "hellaswag",
-    "lambada",  
+    "lambada",
     "piqa",
     "openbookqa",
     "arc_easy",
@@ -1527,7 +1562,12 @@ def validate_datasets(task_names):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", nargs="+", required=True, help="Checkpoint path(s) or HF model ID(s)")
+    p.add_argument(
+        "--model",
+        nargs="+",
+        required=True,
+        help="Path(s) to local DeepSeek-V3 project checkpoint(s)",
+    )
     p.add_argument("--tasks", default=",".join(DEFAULT_TASKS), help="Comma-separated tasks or 'all'")
     p.add_argument("--limit", type=int, default=None, help="Maximum examples per task")
     p.add_argument("--device", default=None, help="cuda / cpu; auto if omitted")
@@ -1559,7 +1599,15 @@ def main():
         print("\nAll selected datasets are accessible.")
         return
 
-    results = {"meta": {"device": device, "tasks": task_names, "limit": args.limit, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}, "models": {}}
+    results = {
+        "meta": {
+            "device": device,
+            "tasks": task_names,
+            "limit": args.limit,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "models": {},
+    }
 
     for identifier in args.model:
         print("\n" + "=" * 80)

@@ -1038,7 +1038,7 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     # Checkpoint / resume
-    resume_from = None
+    resume_from = "log/model_00250.pt"
     # Example: resume_from = "log/model_02000.pt"
 
     if resume_from is not None:

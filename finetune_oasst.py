@@ -47,9 +47,29 @@ import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
 
-# -----------------------------------------------------------------------------
-# DeepSeekV3 model (same architecture as the user's base DeepSeekV3 training code)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# DeepSeek-V3 Architecture & Adapter
+# =============================================================================
+#
+# This evaluation file uses the same model naming/configuration convention as
+# the DeepSeekV3 fine-tuning script:
+#
+#     DeepSeekV3Config
+#     DeepSeekV3
+#
+# The checkpoint must therefore contain:
+#     {
+#         "model": state_dict,
+#         "config": vars(DeepSeekV3Config),
+#         ...
+#     }
+#
+# MLA is evaluated through a full-sequence path (no KV-cache writes) because
+# benchmark completion scoring needs logits for every token. This is the same
+# mathematical MLA used by the fine-tuning model, without inference caching.
+# =============================================================================
+
+from typing import Tuple, Optional, Literal
 
 try:
     from kernel import act_quant, weight_dequant, fp8_gemm
@@ -463,146 +483,155 @@ class MLA(nn.Module):
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        if attn_impl == "naive":
-            self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
-            self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
-        else:
-            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
-            self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int = 0,
+        freqs_cis: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        Full-sequence MLA path used by evaluation.
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0, freqs_cis: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None):
-        # Training uses a direct, differentiable MLA path without KV-cache
-        # assignments. The original inference implementation stores K/V in
-        # buffers, which would sever the autograd graph during pretraining.
-        if self.training:
-            bsz, seqlen, _ = x.size()
-            if freqs_cis is None:
-                raise ValueError("freqs_cis is required during training")
+        This implementation intentionally has no KV cache. Benchmark scoring
+        needs logits for every token in the supplied sequence, so keeping a
+        decode-time cache here would add state and memory without helping the
+        benchmark workload.
+        """
+        del start_pos  # kept for API compatibility with Block
 
-            if self.q_lora_rank == 0:
-                q = self.wq(x)
-            else:
-                q = self.wq_b(self.q_norm(self.wq_a(x)))
-            q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-            q_nope, q_pe = torch.split(
-                q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-            q_pe = apply_rotary_emb(q_pe, freqs_cis)
-
-            kv = self.wkv_a(x)
-            kv, k_pe = torch.split(
-                kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(
-                bsz,
-                seqlen,
-                self.n_local_heads,
-                self.qk_nope_head_dim + self.v_head_dim,
-            )
-            k_nope, v = torch.split(
-                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
-
-            k = torch.cat(
-                [k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1
-            )
-            q = torch.cat([q_nope, q_pe], dim=-1)
-
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask,
-                is_causal=(mask is None),
-            )
-            y = y.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-            return self.wo(y)
-
-        # Inference path: preserve the repository's original cache-aware MLA.
         bsz, seqlen, _ = x.size()
-        end_pos = start_pos + seqlen
-        if freqs_cis is None:
-            freqs_cis = self._freqs_from_length(seqlen, x.device)
 
+        if freqs_cis is None:
+            raise ValueError("freqs_cis is required for MLA evaluation")
+
+        # ---------------------------------------------------------
+        # Query projection
+        # ---------------------------------------------------------
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(
-            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+            q = self.wq_b(
+                self.q_norm(
+                    self.wq_a(x)
+                )
+            )
 
-        if attn_impl == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(
-                bsz, seqlen, self.n_local_heads,
-                self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = torch.split(
-                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
-            k = torch.cat(
-                [k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1
-            )
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum(
-                "bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]
-            ) * self.softmax_scale
-        else:
-            wkv_b = (
-                self.wkv_b.weight
-                if self.wkv_b.scale is None
-                else weight_dequant(
-                    self.wkv_b.weight, self.wkv_b.scale, kernel_block_size
+        q = q.view(
+            bsz,
+            seqlen,
+            self.n_local_heads,
+            self.qk_head_dim,
+        )
+
+        q_nope, q_pe = torch.split(
+            q,
+            [
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            ],
+            dim=-1,
+        )
+
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+
+        # ---------------------------------------------------------
+        # KV latent projection
+        # ---------------------------------------------------------
+        kv = self.wkv_a(x)
+
+        kv, k_pe = torch.split(
+            kv,
+            [
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            ],
+            dim=-1,
+        )
+
+        k_pe = apply_rotary_emb(
+            k_pe.unsqueeze(2),
+            freqs_cis,
+        )
+
+        # ---------------------------------------------------------
+        # Absorb WKV-B into Q / V path.
+        # This is the same mathematical "absorb" formulation used by
+        # the adapted DeepSeek implementation, but without cache writes.
+        # ---------------------------------------------------------
+        wkv_b = self.wkv_b.weight
+
+        if getattr(self.wkv_b, "scale", None) is not None:
+            if weight_dequant is None:
+                raise RuntimeError(
+                    "Quantized MLA weight requires the project's kernel.py"
                 )
+
+            wkv_b = weight_dequant(
+                self.wkv_b.weight,
+                self.wkv_b.scale,
+                kernel_block_size,
             )
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum(
-                "bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim]
+
+        wkv_b = wkv_b.view(
+            self.n_local_heads,
+            -1,
+            self.kv_lora_rank,
+        )
+
+        q_nope = torch.einsum(
+            "bshd,hdc->bshc",
+            q_nope,
+            wkv_b[:, :self.qk_nope_head_dim],
+        )
+
+        latent_kv = self.kv_norm(kv)
+
+        # ---------------------------------------------------------
+        # Attention scores
+        # ---------------------------------------------------------
+        scores = (
+            torch.einsum(
+                "bshc,btc->bsht",
+                q_nope,
+                latent_kv,
             )
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            scores = (
-                torch.einsum(
-                    "bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]
-                )
-                + torch.einsum(
-                    "bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos]
-                )
-            ) * self.softmax_scale
+            +
+            torch.einsum(
+                "bshr,btr->bsht",
+                q_pe,
+                k_pe.squeeze(2),
+            )
+        ) * self.softmax_scale
 
         if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        if attn_impl == "naive":
-            x = torch.einsum(
-                "bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos]
-            )
-        else:
-            x = torch.einsum(
-                "bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos]
-            )
-            x = torch.einsum(
-                "bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:]
-            )
-        return self.wo(x.flatten(2))
+            scores = scores + mask.unsqueeze(1)
 
+        scores = F.softmax(
+            scores,
+            dim=-1,
+            dtype=torch.float32,
+        ).type_as(x)
+
+        # ---------------------------------------------------------
+        # Values
+        # ---------------------------------------------------------
+        values = torch.einsum(
+            "bsht,btc->bshc",
+            scores,
+            latent_kv,
+        )
+
+        values = torch.einsum(
+            "bshc,hdc->bshd",
+            values,
+            wkv_b[:, -self.v_head_dim:],
+        )
+
+        # ---------------------------------------------------------
+        # Output projection
+        # ---------------------------------------------------------
+        return self.wo(values.flatten(2))
 
 
 class MLP(nn.Module):
@@ -856,9 +885,14 @@ class DeepSeekV3(nn.Module):
     conventions as the GPT-2 training file used in this project.
     """
 
-    def __init__(self, config: DeepSeekV3Config):
+    def __init__(
+        self,
+        config: DeepSeekV3Config,
+        init_weights: bool = True,
+    ):
         super().__init__()
         self.config = config
+        self.init_weights = init_weights
 
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -886,7 +920,7 @@ class DeepSeekV3(nn.Module):
             persistent=False,
         )
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, loss_mask=None):
         B, T = idx.size()
         assert T <= self.config.block_size, (
             f"Cannot forward sequence of length {T}, "
@@ -896,21 +930,28 @@ class DeepSeekV3(nn.Module):
         x = self.embed(idx)
         freqs_cis = self.freqs_cis[:T].to(idx.device)
 
-        mask = None
+        attn_mask = None
         if not self.training and T > 1:
-            mask = torch.full((T, T), float("-inf"), device=idx.device).triu_(1)
+            attn_mask = torch.full((T, T), float("-inf"), device=idx.device).triu_(1)
 
         for layer in self.layers:
-            x = layer(x, 0, freqs_cis, mask)
+            x = layer(x, 0, freqs_cis, attn_mask)
 
         x = self.norm(x)
         logits = self.head(x)
 
         if targets is not None:
-            loss = F.cross_entropy(
+            per_token_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
+                reduction="none",
             )
+            if loss_mask is not None:
+                loss_mask = loss_mask.reshape(-1).to(per_token_loss.dtype)
+                denom = loss_mask.sum().clamp_min(1.0)
+                loss = (per_token_loss * loss_mask).sum() / denom
+            else:
+                loss = per_token_loss.mean()
         else:
             loss = None
 
@@ -1013,7 +1054,7 @@ def encode_conversation(messages, enc, block_size):
             loss_mask.extend([0] * (len(prefix) + len(text_tokens)))
         else:
             prefix = enc.encode(SPECIAL_ASSISTANT)
-            text_tokens = enc.encode(msg["text"].strip())
+            text_tokens = enc.encode(msg["text"].strip(), disallowed_special=())
             part = prefix + text_tokens + [eot]
             token_ids.extend(part)
             loss_mask.extend([0] * len(prefix) + [1] * (len(text_tokens) + 1))
@@ -1248,6 +1289,8 @@ def train(args):
             "Use --block-size matching the checkpoint."
         )
 
+    model = model.to(device)
+    
     model.train()
     optimizer = torch.optim.AdamW(
         model.parameters(),

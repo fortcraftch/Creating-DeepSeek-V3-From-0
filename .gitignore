@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Hugging Face / datasets cache
+.cache/
+.cache_huggingface/
+huggingface/
+hf_cache/
+
+# Hellaswag cache
+hellaswag/
+
+# Local dataset shards
+edu_fineweb10B/
+plots/
+results/
+data/
+
+# Training outputs
+log/
+*.pt
+*.pth
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables / secrets
+.env
