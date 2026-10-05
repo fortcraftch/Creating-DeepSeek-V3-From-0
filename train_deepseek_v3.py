@@ -1,4 +1,9 @@
 import os
+import argparse
+import json
+import sys
+from pathlib import Path
+from train_restart import supervise, publish_checkpoint, atomic_checkpoint
 import math
 import time
 import inspect
@@ -935,12 +940,11 @@ def load_tokens(filename):
 
 
 class DataLoaderLite:
-    def __init__(self, B, T, split):
+    def __init__(self, B, T, split, data_root="edu_fineweb10B"):
         self.B = B
         self.T = T
         assert split in {"train", "val"}
 
-        data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
@@ -1020,16 +1024,47 @@ def autocast_context(device):
 # ---------------------------------------------------------------------------
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    p = argparse.ArgumentParser(description="DeepSeek V3 training with optional CUDA restart")
+    p.add_argument('--resume', type=Path)
+    p.add_argument('--config', type=Path, help='Model config JSON for a fresh run')
+    p.add_argument('--data-root', default='edu_fineweb10B')
+    p.add_argument('--log-dir', type=Path, default=Path('log'))
+    p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--batch-size', type=int, default=8)
+    p.add_argument('--seq-len', type=int, default=1024)
+    p.add_argument('--total-batch-size', type=int, default=524288)
+    p.add_argument('--max-steps', type=int, default=19073)
+    p.add_argument('--max-lr', type=float, default=6e-4)
+    p.add_argument('--warmup-steps', type=int, default=715)
+    p.add_argument('--val-interval', type=int, default=250)
+    p.add_argument('--val-steps', type=int, default=10)
+    p.add_argument('--save-interval', type=int, default=25)
+    p.add_argument('--keep-checkpoints', type=int, default=3, help='0 keeps all numbered checkpoints')
+    p.add_argument('--skip-hellaswag', action='store_true')
+    p.add_argument('--skip-sampling', action='store_true')
+    p.add_argument('--auto-restart', action='store_true')
+    p.add_argument('--max-restarts', type=int, default=5)
+    p.add_argument('--restart-delay', type=float, default=15)
+    args = p.parse_args()
+    if min(args.batch_size,args.seq_len,args.total_batch_size,args.max_steps,args.val_interval,args.val_steps,args.save_interval,args.max_lr)<=0 or min(args.keep_checkpoints,args.max_restarts,args.restart_delay,args.warmup_steps)<0:
+        p.error('Invalid training/restart settings')
+    if args.total_batch_size % (args.batch_size * args.seq_len):
+        p.error('total-batch-size must be divisible by batch-size * seq-len')
+    if args.resume and args.config:
+        p.error('Choose --resume or --config')
+    if args.auto_restart:
+        supervise(args, sys.argv[1:])
+        return
+    device = args.device
     print("using device:", device)
 
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
-    total_batch_size = 524288
-    B = 8
-    T = 1024
+    total_batch_size = args.total_batch_size
+    B = args.batch_size
+    T = args.seq_len
     assert total_batch_size % (B * T) == 0
     grad_accumulation_steps = total_batch_size // (B * T)
     print(f"total_batch_size: {total_batch_size}")
@@ -1038,20 +1073,23 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     # Checkpoint / resume
-    resume_from = "log/model_00250.pt"
+    resume_from = args.resume
     # Example: resume_from = "log/model_02000.pt"
 
     if resume_from is not None:
         print(f"Loading checkpoint: {resume_from}")
         checkpoint = torch.load(
             resume_from,
-            map_location=device,
+            map_location="cpu",
             weights_only=False,
         )
         config = DeepSeekV3Config(**checkpoint["config"])
         model = DeepSeekV3(config)
         model.load_state_dict(checkpoint["model"])
-        start_step = checkpoint["step"] + 1
+        # Historical checkpoints were saved BEFORE their numbered optimizer step.
+        start_step = checkpoint['step'] + (checkpoint.get('checkpoint_timing') == 'after_optimizer_step')
+        if 'checkpoint_timing' not in checkpoint:
+            print('Legacy checkpoint: replaying its numbered step (saved before update).')
     else:
         config = DeepSeekV3Config(
             block_size=T,
@@ -1077,25 +1115,32 @@ def main():
             max_seq_len=T,
             original_seq_len=T,
         )
+        if args.config:
+            config = DeepSeekV3Config(**json.loads(args.config.read_text(encoding='utf8')))
         model = DeepSeekV3(config)
         start_step = 0
 
+    if T > config.block_size or B > config.max_batch_size:
+        p.error('Batch/context exceeds checkpoint configuration')
+    settings = {k:getattr(args,k) for k in ('batch_size','seq_len','total_batch_size','max_steps','max_lr','warmup_steps','data_root')}
+    if resume_from and checkpoint.get('training_settings') not in (None, settings):
+        p.error('Resume settings differ from saved run; preserve batch, schedule and dataset')
     model.to(device)
     use_compile = False
     if use_compile:
         model = torch.compile(model)
 
-    max_lr = 6e-4
+    max_lr = args.max_lr
     min_lr = max_lr * 0.1
-    warmup_steps = 715
-    max_steps = 19073
+    warmup_steps = args.warmup_steps
+    max_steps = args.max_steps
 
     num_return_sequences = 5
     max_length = 32
 
     enc = tiktoken.get_encoding("gpt2")
-    train_loader = DataLoaderLite(B=B, T=T, split="train")
-    val_loader = DataLoaderLite(B=B, T=T, split="val")
+    train_loader = DataLoaderLite(B=B, T=T, split="train", data_root=args.data_root)
+    val_loader = DataLoaderLite(B=B, T=T, split="val", data_root=args.data_root)
 
     if resume_from is not None:
         train_loader.current_shard = checkpoint["train_shard"]
@@ -1115,27 +1160,37 @@ def main():
     )
     if resume_from is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if 'torch_rng_state' in checkpoint:
+            torch.set_rng_state(checkpoint['torch_rng_state'])
+        if device.startswith('cuda') and checkpoint.get('cuda_rng_states') is not None:
+            torch.cuda.set_rng_state_all(checkpoint['cuda_rng_states'])
         print(f"Resuming from step {start_step}")
+        del checkpoint
 
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    log_dir = "log"
+    log_dir = args.log_dir
+    if not resume_from and log_dir.exists() and any(log_dir.glob('model_*.pt')):
+        p.error('Existing checkpoints: use --resume or a new --log-dir')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "log.txt")
     if resume_from is None:
         with open(log_file, "w"):
             pass
 
+    val_loss_accum = None
+    val_step = None
     for step in range(start_step, max_steps):
         t0 = time.time()
         last_step = step == max_steps - 1
 
         # Validation
-        if step % 250 == 0 or last_step:
+        if step % args.val_interval == 0 or last_step:
             model.eval()
             val_loader.reset()
             val_loss_accum = 0.0
-            val_loss_steps = 10
+            val_loss_steps = args.val_steps
+            val_step = step
             with torch.no_grad():
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
@@ -1147,27 +1202,8 @@ def main():
             with open(log_file, "a") as f:
                 f.write(f"step {step}: val loss {val_loss_accum:.4f}\n")
 
-            if step > 0:
-                checkpoint_path = os.path.join(
-                    log_dir, f"model_{step:05d}.pt"
-                )
-                checkpoint_model = (
-                    model._orig_mod if hasattr(model, "_orig_mod") else model
-                )
-                checkpoint = {
-                    "model": checkpoint_model.state_dict(),
-                    "config": vars(checkpoint_model.config),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "val_loss": val_loss_accum,
-                    "train_shard": train_loader.current_shard,
-                    "train_position": train_loader.current_position,
-                }
-                torch.save(checkpoint, checkpoint_path)
-                print(f"saved checkpoint: {checkpoint_path}")
-
         # HellaSwag
-        if (step % 250 == 0 or last_step) and not use_compile:
+        if (step % args.val_interval == 0 or last_step) and not use_compile and not args.skip_hellaswag:
             model.eval()
             num_correct_norm = 0
             num_total = 0
@@ -1190,7 +1226,7 @@ def main():
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
         # Sampling
-        if ((step > 0 and step % 250 == 0) or last_step) and not use_compile:
+        if ((step > 0 and step % args.val_interval == 0) or last_step) and not use_compile and not args.skip_sampling:
             model.eval()
             tokens = enc.encode("Hello, I'm a language model,")
             tokens = torch.tensor(tokens, dtype=torch.long, device=device)
@@ -1235,6 +1271,22 @@ def main():
             param_group["lr"] = lr
 
         optimizer.step()
+
+        if (step + 1) % args.save_interval == 0 or last_step:
+            checkpoint_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+            path = Path(log_dir) / f'model_{step:05d}.pt'
+            payload = {'model': checkpoint_model.state_dict(), 'config': vars(checkpoint_model.config),
+                'optimizer': optimizer.state_dict(), 'step': step,
+                'checkpoint_timing': 'after_optimizer_step',
+                'val_loss': val_loss_accum, 'val_step': val_step,
+                'val_loss_timing': 'before_val_step_update',
+                'train_shard': train_loader.current_shard, 'train_position': train_loader.current_position,
+                'training_settings': settings, 'torch_rng_state': torch.get_rng_state(),
+                'cuda_rng_states': torch.cuda.get_rng_state_all() if device.startswith('cuda') else None}
+            atomic_checkpoint(path, payload)
+            publish_checkpoint(path, args.keep_checkpoints, os.environ.get('DEEPSEEK_TRAIN_CHECKPOINT_STATUS'))
+            del payload
+            print(f'saved checkpoint: {path}', flush=True)
 
         if device == "cuda":
             torch.cuda.synchronize()
