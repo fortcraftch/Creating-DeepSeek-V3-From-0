@@ -48,3 +48,31 @@ en homelab ni se ha lanzado allí un entrenamiento largo.
 ```bash
 python -m unittest discover -s tests -p test_train_restart.py
 ```
+
+## Variante nativa de aproximadamente124M con16 expertos
+
+Usa el MISMO train_deepseek_v3.py de este proyecto, no ASI. Arquitectura:
+16 expertos enrutados,2 activos/token,2 compartidos y moe_inter_dim125.
+Total verificado:123.846.144 parámetros. Solo cambian n_routed_experts8→16
+y moe_inter_dim224→125; los demás campos se conservan. El ancho compartido
+se calcula como2×moe_inter_dim y también cambia por esa dependencia.
+
+Desde la raíz de este proyecto y con el entorno activado:
+
+```bash
+bash train_124m_16experts.sh edu_fineweb10B
+```
+
+Usar los mismos shards planos train/val .npy del DeepSeek anterior, no el dataset
+categorizado de ASI. Calendario original:batch8,seq1024,batch efectivo524288,
+19073 actualizaciones,LR6e-4,warmup715,seed1337. Nuevo entrenamiento desde cero.
+Salida separada:log_124m_16experts. Mantiene validación y comprobaciones auxiliares
+del entrenador original. Reinicio CUDA, checkpoint cada25 pasos, conserva3.
+No se reutilizan pesos del modelo8expertos. Reanudación solo del nuevo16expertos:
+
+```bash
+bash train_124m_16experts.sh edu_fineweb10B --resume log_124m_16experts/model_XXXXX.pt
+```
+
+La configuración original por defecto de8expertos no se cambia. La anchura125
+prioriza acercarse a124M bajo ese límite; no se ha medido su eficiencia en GPU.
